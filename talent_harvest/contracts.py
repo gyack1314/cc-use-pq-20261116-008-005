@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
-from datetime import datetime
+from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -46,6 +46,20 @@ def instant(value: Any, field: str) -> str:
     return parsed.isoformat()
 
 
+def utc_instant(value: Any, field: str) -> str:
+    parsed = datetime.fromisoformat(instant(value, field))
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
+def business_date(value: Any, field: str) -> str:
+    if not isinstance(value, str):
+        raise HarvestError("invalid_date", f"{field} must be YYYY-MM-DD")
+    try:
+        return datetime.strptime(value.strip(), "%Y-%m-%d").date().isoformat()
+    except ValueError:
+        raise HarvestError("invalid_date", f"{field} must be YYYY-MM-DD") from None
+
+
 def canonical(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
@@ -88,10 +102,56 @@ class Source:
 
 
 @dataclass(frozen=True)
+class SupersedesRef:
+    record_id: str
+    version: int
+    source: str | None
+
+    @classmethod
+    def parse(cls, value: Any) -> "SupersedesRef":
+        if not isinstance(value, dict):
+            raise HarvestError("supersedes_shape", "supersedes entry must be object")
+        version = value.get("version")
+        if type(version) is not int or not 1 <= version <= 1_000_000:
+            raise HarvestError("supersedes_version", "superseded version must be positive integer")
+        source = value.get("source")
+        if source is not None:
+            source = identifier(source, "supersedes source")
+        return cls(identifier(value.get("record_id"), "supersedes record_id"), version, source)
+
+    def document(self) -> dict[str, Any]:
+        doc: dict[str, Any] = {"record_id": self.record_id, "version": self.version}
+        if self.source is not None:
+            doc["source"] = self.source
+        return doc
+
+
+@dataclass(frozen=True)
+class Correction:
+    effective_at: str
+    supersedes: tuple[SupersedesRef, ...]
+
+    @classmethod
+    def parse(cls, value: Any) -> "Correction":
+        if not isinstance(value, dict):
+            raise HarvestError("correction_shape", "correction must be object")
+        raw = value.get("supersedes")
+        if not isinstance(raw, list) or not 1 <= len(raw) <= 1000:
+            raise HarvestError("supersedes", "correction requires 1-1000 supersedes entries")
+        refs = tuple(dict.fromkeys(SupersedesRef.parse(item) for item in raw))
+        return cls(business_date(value.get("effective_at"), "effective_at"), refs)
+
+    def document(self) -> dict[str, Any]:
+        return {"effective_at": self.effective_at,
+                "supersedes": [item.document() for item in self.supersedes]}
+
+
+@dataclass(frozen=True)
 class Page:
     ordinal: int
     path: str
     sha256: str
+    correction: Correction | None = None
 
     @classmethod
     def parse(cls, value: Any) -> "Page":
@@ -104,10 +164,15 @@ class Page:
             raise HarvestError("page_path", "page path must stay under manifest directory")
         if not isinstance(checksum, str) or not HEX.fullmatch(checksum):
             raise HarvestError("page_checksum", "sha256 must be 64 lowercase hex digits")
-        return cls(ordinal, path, checksum)
+        raw_correction = value.get("correction")
+        correction = Correction.parse(raw_correction) if raw_correction is not None else None
+        return cls(ordinal, path, checksum, correction)
 
     def document(self) -> dict[str, Any]:
-        return asdict(self)
+        doc: dict[str, Any] = {"ordinal": self.ordinal, "path": self.path, "sha256": self.sha256}
+        if self.correction is not None:
+            doc["correction"] = self.correction.document()
+        return doc
 
 
 @dataclass(frozen=True)

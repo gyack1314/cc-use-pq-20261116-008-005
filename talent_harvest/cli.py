@@ -36,12 +36,25 @@ def parser() -> ArgumentParser:
     withdraw.add_argument("--reason", required=True)
     current = actions.add_parser("current", help="show current accepted records")
     current.add_argument("--quarantine", action="store_true")
+    replay_view = actions.add_parser("replay", help="replay delivery as of a knowledge cutoff and business date")
+    replay_view.add_argument("--knowledge", help="knowledge cutoff ISO timestamp with timezone")
+    replay_view.add_argument("--business", help="business date YYYY-MM-DD")
+    replay_view.add_argument("--quarantine", action="store_true")
     history = actions.add_parser("history", help="show raw history")
     history.add_argument("--source")
     history.add_argument("--identity")
     trace = actions.add_parser("trace", help="show record and event lineage")
     trace.add_argument("identity")
-    actions.add_parser("summary", help="aggregate accepted quantities")
+    summary_view = actions.add_parser("summary", help="aggregate accepted quantities")
+    summary_view.add_argument("--knowledge", help="knowledge cutoff ISO timestamp with timezone")
+    summary_view.add_argument("--business", help="business date YYYY-MM-DD")
+    withdraw_correction = actions.add_parser("withdraw-correction", help="withdraw a registered correction")
+    withdraw_correction.add_argument("source")
+    withdraw_correction.add_argument("batch")
+    withdraw_correction.add_argument("ordinal", type=int)
+    withdraw_correction.add_argument("--reason", required=True)
+    correction_list = actions.add_parser("corrections", help="list registered corrections")
+    correction_list.add_argument("--source")
     actions.add_parser("audit", help="verify persisted state invariants")
     actions.add_parser("operations", help="summarize batch and page progress")
     report = actions.add_parser("source-report", help="inspect source intake and quality")
@@ -121,12 +134,19 @@ def execute(args: Namespace) -> dict:
             return harvester.withdraw(args.source, args.reason)
         if args.action == "current":
             return delivery.current(include_quarantine=args.quarantine)
+        if args.action == "replay":
+            return delivery.replay(knowledge=args.knowledge, business=args.business,
+                                   include_quarantine=args.quarantine)
         if args.action == "history":
             return delivery.history(source=args.source, identity=args.identity)
         if args.action == "trace":
             return delivery.trace(args.identity)
         if args.action == "summary":
-            return delivery.summary()
+            return delivery.summary(knowledge=args.knowledge, business=args.business)
+        if args.action == "withdraw-correction":
+            return harvester.withdraw_correction(args.source, args.batch, args.ordinal, args.reason)
+        if args.action == "corrections":
+            return Lineage(ledger).corrections(source=args.source)
         if args.action == "audit":
             return Auditor(ledger).verify_state()
         if args.action == "operations":

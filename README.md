@@ -27,12 +27,16 @@ ingest 对失败页返回非零退出码，并将原因保存在数据库。修�
 
 每条记录需要 record_id、organization、title、region、discipline、quantity、published_at（YYYY-MM-DD）；reference 与 description 可选。数量为非负整数，零数量、未来发布日期、低可信来源和缺少明确引用的合作项目会被隔离。基础实体键由类别、机构、标题和地区确定；相同实体的不同来源若数量、学科或发布日期不一致，会列入争议而非当前可用数据。实体键是精确规范化后的匹配，不做模糊别名判断。
 
+清单中的页可声明 correction 对象成为更正页：effective_at（业务生效日期，YYYY-MM-DD）与 supersedes（所替代的同来源记录版本列表，每项含 record_id、version，可选 source）。采入时逐项校验：替代版本必须已登记、不得跨来源、不得与已登记的更正链形成循环；校验失败的页保留可重试的失败状态，未通过校验的更正不会进入任何结果。合法更正在同一页事务内写入采集到达时间（observed_at）、业务生效日期（effective_at）与替代关系（corrections 表），三者与页记录一起原子提交。普通记录的业务生效日期等于其 published_at。
+
 ## 查询与运维
 
 - current --quarantine 返回有效实体、争议与隔离记录；默认不附带隔离明细。
-- history、trace IDENTITY、record SOURCE ID、timeline SOURCE、batch-evidence SOURCE BATCH 追踪来源与修订。
+- replay [--knowledge TS] [--business YYYY-MM-DD] 双时态回放：--knowledge 回答"在某知识截止时点我们实际知道什么"（按采集到达时间过滤），--business 回答"按当前掌握的更正，某业务日应是什么样"（按业务生效日期选择版本）。回放按相应时点应用质量、去重、争议与来源撤回规则，而不是简单按发布日期过滤；结果同时列出采用的证据与排除的证据（附排除原因），并用 explanations 说明生效更正、已撤回更正与知识截止的影响。
+- summary、distribution、coverage、age YYYY-MM-DD、trend 和 conflicts 提供当前与历史摘要；summary 支持 --knowledge/--business 汇总回放视图。
+- corrections [--source] 列出已登记更正及其状态；withdraw-correction SOURCE BATCH ORDINAL --reason TEXT 撤回更正：历史交付（已写出的快照）不变，撤回后当前视图与新回放恢复被替代版本，并在 explanations 中说明差异。
+- history、trace IDENTITY、record SOURCE ID、timeline SOURCE、batch-evidence SOURCE BATCH 追踪来源与修订；record 的版本链标注每版的业务生效日期、更正出处与被替代关系。
 - status SOURCE BATCH、operations、recovery、quality、audit 检查页级恢复和数据状态。
-- summary、distribution、coverage、age YYYY-MM-DD、trend 和 conflicts 提供当前与历史摘要。
 - snapshot FILE 写出当前视图与摘要；verify FILE SHA256 校验交付字节。
 - preview SOURCE_JSON MANIFEST 在不登记批次的情况下检查本地文件；replay-check MANIFEST 对已完成批次复核原始镜像；checkpoint 读取游标快照。
 

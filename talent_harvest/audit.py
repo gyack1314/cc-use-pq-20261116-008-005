@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from datetime import datetime
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
 import json
 
-from .contracts import HarvestError, Manifest, Record, Source, canonical, content_digest
+from .contracts import HarvestError, Manifest, Record, Source, canonical, content_digest, instant
 from .intake import manifest_digest
 from .ledger import Ledger
 
@@ -45,12 +46,16 @@ class Auditor:
         records = self.ledger.db.execute("SELECT * FROM source_records ORDER BY source,record_id").fetchall()
         for record in records:
             findings.extend(self._record_cursor(record))
+        corrections = self.ledger.db.execute("SELECT * FROM corrections ORDER BY id").fetchall()
+        for correction in corrections:
+            findings.extend(self._correction(correction))
         foreign_keys = self.ledger.db.execute("PRAGMA foreign_key_check").fetchall()
         for row in foreign_keys:
             findings.append(Finding("error", "foreign_key", str(tuple(row)), "dangling reference"))
         return {"ok": not any(f.severity == "error" for f in findings),
                 "counts": {"sources": len(sources), "batches": len(batches), "pages": len(pages),
-                           "observations": len(observations), "record_cursors": len(records)},
+                           "observations": len(observations), "record_cursors": len(records),
+                           "corrections": len(corrections)},
                 "findings": [finding.document() for finding in findings]}
 
     def _source(self, row: Any) -> list[Finding]:
@@ -86,6 +91,12 @@ class Auditor:
         for page, declared in zip(pages, manifest.pages):
             if page["ordinal"] != declared.ordinal or page["path"] != declared.path or page["digest"] != declared.sha256:
                 result.append(Finding("error", "page_declaration", location, f"page {declared.ordinal} differs"))
+            if declared.correction is not None and page["state"] == "complete":
+                stored = self.ledger.db.execute("SELECT count(*) FROM corrections WHERE source=? AND batch=? AND ordinal=?",
+                                                (row["source"], row["batch"], declared.ordinal)).fetchone()[0]
+                if stored == 0:
+                    result.append(Finding("error", "correction_missing", location,
+                                          f"page {declared.ordinal} declares a correction but none is stored"))
         if row["state"] == "complete" and (not pages or any(p["state"] != "complete" for p in pages)):
             result.append(Finding("error", "batch_state", location, "complete batch has incomplete page"))
         if pages and all(p["state"] == "complete" for p in pages) and row["state"] != "complete":
@@ -147,6 +158,51 @@ class Auditor:
                                                        (row["source"], row["record_id"]))]
         if versions != list(range(1, len(versions) + 1)):
             result.append(Finding("error", "version_gap", location, "versions are not contiguous"))
+        return result
+
+    def _correction(self, row: Any) -> list[Finding]:
+        location = f"correction:{row['source']}/{row['batch']}/{row['ordinal']}#{row['id']}"
+        result: list[Finding] = []
+        page = self.ledger.db.execute("SELECT state FROM pages WHERE source=? AND batch=? AND ordinal=?",
+                                      (row["source"], row["batch"], row["ordinal"])).fetchone()
+        if page is None:
+            result.append(Finding("error", "correction_page", location, "correction references missing page"))
+        elif page["state"] != "complete":
+            result.append(Finding("error", "correction_page", location, "correction page is not complete"))
+        target = self.ledger.db.execute("SELECT 1 FROM observations WHERE source=? AND record_id=? AND version=? LIMIT 1",
+                                        (row["source"], row["target_record_id"], row["target_version"])).fetchone()
+        if target is None:
+            result.append(Finding("error", "correction_target", location, "superseded version is not registered"))
+        try:
+            datetime.strptime(row["effective_at"], "%Y-%m-%d")
+        except (TypeError, ValueError):
+            result.append(Finding("error", "correction_effective", location, "effective date must be YYYY-MM-DD"))
+        if row["withdrawn_at"] is not None:
+            try:
+                instant(row["withdrawn_at"], "withdrawn_at")
+            except HarvestError:
+                result.append(Finding("error", "correction_withdrawal", location, "withdrawal timestamp invalid"))
+        batch = self.ledger.db.execute("SELECT manifest_json FROM batches WHERE source=? AND batch=?",
+                                       (row["source"], row["batch"])).fetchone()
+        declared = None
+        if batch is not None:
+            try:
+                manifest = Manifest.parse(json.loads(batch["manifest_json"]))
+                declared = next((item.correction for item in manifest.pages
+                                 if item.ordinal == row["ordinal"]), None)
+            except (HarvestError, ValueError, TypeError):
+                declared = None
+        if declared is None:
+            result.append(Finding("error", "correction_manifest", location,
+                                  "manifest does not declare this correction"))
+        else:
+            if declared.effective_at != row["effective_at"]:
+                result.append(Finding("error", "correction_manifest", location,
+                                      "effective date differs from manifest"))
+            if not any(item.record_id == row["target_record_id"] and item.version == row["target_version"]
+                       for item in declared.supersedes):
+                result.append(Finding("error", "correction_manifest", location,
+                                      "superseded version not declared in manifest"))
         return result
 
     def operational(self) -> dict:

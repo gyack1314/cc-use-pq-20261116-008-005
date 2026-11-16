@@ -25,7 +25,7 @@ def record(record_id="role-1", organization="North University", title="AI Engine
 
 
 def manifest(workspace: Path, key="company", batch="batch-1", pages=None,
-             captured_at="2026-09-30T08:00:00+00:00", fmt="json"):
+             captured_at="2026-09-30T08:00:00+00:00", fmt="json", corrections=None):
     pages = pages if pages is not None else [[record()]]
     directory = workspace / key / batch
     directory.mkdir(parents=True, exist_ok=True)
@@ -52,7 +52,10 @@ def manifest(workspace: Path, key="company", batch="batch-1", pages=None,
             raise ValueError(fmt)
         name = f"page-{ordinal}.{suffix}"
         (directory / name).write_bytes(payload)
-        descriptors.append({"ordinal": ordinal, "path": name, "sha256": sha256(payload).hexdigest()})
+        descriptor = {"ordinal": ordinal, "path": name, "sha256": sha256(payload).hexdigest()}
+        if corrections and ordinal in corrections:
+            descriptor["correction"] = corrections[ordinal]
+        descriptors.append(descriptor)
     data = {"source": key, "batch": batch, "captured_at": captured_at, "pages": descriptors}
     path = directory / "manifest.json"
     path.write_text(canonical(data), encoding="utf-8")

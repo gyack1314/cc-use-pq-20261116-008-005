@@ -8,7 +8,7 @@ from typing import Iterator
 import json
 import sqlite3
 
-from .contracts import HarvestError, Manifest, Record, Source, canonical
+from .contracts import Correction, HarvestError, Manifest, Record, Source, canonical
 from .intake import manifest_digest
 
 
@@ -39,7 +39,7 @@ CREATE TABLE IF NOT EXISTS observations (
  ordinal INTEGER NOT NULL, record_id TEXT NOT NULL, identity TEXT NOT NULL,
  record_json TEXT NOT NULL, raw_json TEXT NOT NULL, raw_digest TEXT NOT NULL,
  status TEXT NOT NULL, reasons TEXT NOT NULL, version INTEGER NOT NULL,
- captured_at TEXT NOT NULL, observed_at TEXT NOT NULL,
+ captured_at TEXT NOT NULL, observed_at TEXT NOT NULL, effective_at TEXT,
  UNIQUE(source,batch,ordinal,record_id),
  FOREIGN KEY(source,batch,ordinal) REFERENCES pages(source,batch,ordinal)
 );
@@ -50,6 +50,15 @@ CREATE TABLE IF NOT EXISTS source_records (
  version INTEGER NOT NULL, latest_observation INTEGER NOT NULL REFERENCES observations(id),
  PRIMARY KEY(source,record_id)
 );
+CREATE TABLE IF NOT EXISTS corrections (
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ source TEXT NOT NULL, batch TEXT NOT NULL, ordinal INTEGER NOT NULL,
+ record_id TEXT NOT NULL, target_record_id TEXT NOT NULL, target_version INTEGER NOT NULL,
+ effective_at TEXT NOT NULL, registered_at TEXT NOT NULL, withdrawn_at TEXT,
+ FOREIGN KEY(source,batch,ordinal) REFERENCES pages(source,batch,ordinal)
+);
+CREATE INDEX IF NOT EXISTS corrections_page ON corrections(source,batch,ordinal);
+CREATE INDEX IF NOT EXISTS corrections_target ON corrections(source,target_record_id,target_version);
 CREATE TABLE IF NOT EXISTS events (
  id INTEGER PRIMARY KEY AUTOINCREMENT, event_type TEXT NOT NULL,
  source TEXT, batch TEXT, ordinal INTEGER, payload TEXT NOT NULL,
@@ -70,6 +79,17 @@ class Ledger:
         self.db.row_factory = Row
         self.db.executescript(SCHEMA)
         self.db.execute("PRAGMA busy_timeout=30000")
+        self._migrate()
+
+    def _migrate(self) -> None:
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(observations)")}
+        if "effective_at" not in columns:
+            self.db.execute("ALTER TABLE observations ADD COLUMN effective_at TEXT")
+            for row in self.db.execute("SELECT id,record_json FROM observations").fetchall():
+                published = json.loads(row["record_json"])["published_at"]
+                self.db.execute("UPDATE observations SET effective_at=? WHERE id=?",
+                                (published, row["id"]))
+            self.db.commit()
 
     def close(self) -> None:
         self.db.close()
@@ -178,31 +198,47 @@ class Ledger:
             self.event("page_failed", source, batch, ordinal, {"code": error.code, "detail": error.detail})
 
     def commit_page(self, source: str, batch: str, ordinal: int,
-                    items: list[tuple[Record, dict, str, tuple[str, ...]]]) -> dict:
+                    items: list[tuple[Record, dict, str, tuple[str, ...]]],
+                    correction: Correction | None = None) -> dict:
         with self.transaction():
             row = self.page(source, batch, ordinal)
             if row["state"] == "complete":
                 return {"ordinal": ordinal, "unchanged": True, "records": row["record_count"]}
+            if correction is not None:
+                self._validate_correction(source, items, correction)
             captured = self.db.execute("SELECT captured_at FROM batches WHERE source=? AND batch=?",
                                        (source, batch)).fetchone()[0]
+            arrived = utc_now()
             for record, raw, status, reasons in items:
                 previous = self.db.execute("SELECT version FROM source_records WHERE source=? AND record_id=?",
                                            (source, record.source_record_id)).fetchone()
                 version = previous[0] + 1 if previous else 1
-                cursor = self.db.execute("INSERT INTO observations(source,batch,ordinal,record_id,identity,record_json,raw_json,raw_digest,status,reasons,version,captured_at,observed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                effective = correction.effective_at if correction is not None else record.published_at
+                cursor = self.db.execute("INSERT INTO observations(source,batch,ordinal,record_id,identity,record_json,raw_json,raw_digest,status,reasons,version,captured_at,observed_at,effective_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                                          (source, batch, ordinal, record.source_record_id, record.identity,
                                           canonical(record.document()), canonical(raw), record.raw_digest,
-                                          status, canonical(reasons), version, captured, utc_now()))
+                                          status, canonical(reasons), version, captured, arrived, effective))
                 self.db.execute("INSERT INTO source_records(source,record_id,version,latest_observation) VALUES(?,?,?,?) ON CONFLICT(source,record_id) DO UPDATE SET version=excluded.version,latest_observation=excluded.latest_observation",
                                 (source, record.source_record_id, version, cursor.lastrowid))
+            if correction is not None:
+                page_records = [record.source_record_id for record, _, _, _ in items] or [""]
+                for record_id in page_records:
+                    for target in correction.supersedes:
+                        self.db.execute("INSERT INTO corrections(source,batch,ordinal,record_id,target_record_id,target_version,effective_at,registered_at) VALUES(?,?,?,?,?,?,?,?)",
+                                        (source, batch, ordinal, record_id, target.record_id,
+                                         target.version, correction.effective_at, arrived))
+                self.event("correction_registered", source, batch, ordinal,
+                           {"effective_at": correction.effective_at,
+                            "records": [item for item in page_records if item],
+                            "supersedes": [target.document() for target in correction.supersedes]})
             self.db.execute("UPDATE pages SET state='complete',attempts=attempts+1,error_code=NULL,error_detail=NULL,processed_at=?,record_count=? WHERE source=? AND batch=? AND ordinal=?",
-                            (utc_now(), len(items), source, batch, ordinal))
+                            (arrived, len(items), source, batch, ordinal))
             self.event("page_committed", source, batch, ordinal, {"records": len(items)})
             incomplete = self.db.execute("SELECT count(*) FROM pages WHERE source=? AND batch=? AND state!='complete'",
                                          (source, batch)).fetchone()[0]
             if incomplete == 0:
                 self.db.execute("UPDATE batches SET state='complete',completed_at=? WHERE source=? AND batch=?",
-                                (utc_now(), source, batch))
+                                (arrived, source, batch))
                 self.event("batch_completed", source, batch, None, {"records_last_page": len(items)})
             else:
                 failed = self.db.execute("SELECT count(*) FROM pages WHERE source=? AND batch=? AND state='failed'",
@@ -210,6 +246,82 @@ class Ledger:
                 self.db.execute("UPDATE batches SET state=? WHERE source=? AND batch=?",
                                 ("failed" if failed else "pending", source, batch))
             return {"ordinal": ordinal, "unchanged": False, "records": len(items)}
+
+    def _validate_correction(self, source: str,
+                             items: list[tuple[Record, dict, str, tuple[str, ...]]],
+                             correction: Correction) -> None:
+        for target in correction.supersedes:
+            if target.source is not None and target.source != source:
+                raise HarvestError("correction_cross_source",
+                                   f"superseded record {target.source}:{target.record_id} is not from source {source}")
+            known = self.db.execute("SELECT 1 FROM observations WHERE source=? AND record_id=? AND version=? LIMIT 1",
+                                    (source, target.record_id, target.version)).fetchone()
+            if known is None:
+                raise HarvestError("correction_target_unknown",
+                                   f"{source}:{target.record_id} version {target.version} is not registered")
+        new_edges = [(record.source_record_id, target.record_id)
+                     for record, _, _, _ in items for target in correction.supersedes]
+        if self._correction_cycle(source, new_edges):
+            raise HarvestError("correction_cycle",
+                               "correction would create a cycle in the registered replacement chain")
+
+    def _correction_cycle(self, source: str, new_edges: list[tuple[str, str]]) -> bool:
+        graph: dict[str, set[str]] = {}
+        rows = self.db.execute("SELECT record_id,target_record_id FROM corrections WHERE source=? AND withdrawn_at IS NULL",
+                               (source,)).fetchall()
+        for start, end in list(rows) + new_edges:
+            if start and start != end:
+                graph.setdefault(start, set()).add(end)
+        state: dict[str, int] = {}
+        for root in graph:
+            if state.get(root, 0) != 0:
+                continue
+            state[root] = 1
+            stack = [(root, iter(sorted(graph.get(root, ()))))]
+            while stack:
+                node, edges = stack[-1]
+                descended = False
+                for nxt in edges:
+                    mark = state.get(nxt, 0)
+                    if mark == 1:
+                        return True
+                    if mark == 0:
+                        state[nxt] = 1
+                        stack.append((nxt, iter(sorted(graph.get(nxt, ())))))
+                        descended = True
+                        break
+                if not descended:
+                    state[node] = 2
+                    stack.pop()
+        return False
+
+    def corrections(self, *, source: str | None = None) -> list[dict]:
+        if source is None:
+            rows = self.db.execute("SELECT * FROM corrections ORDER BY id").fetchall()
+        else:
+            rows = self.db.execute("SELECT * FROM corrections WHERE source=? ORDER BY id", (source,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def withdraw_correction(self, source: str, batch: str, ordinal: int, reason: str) -> dict:
+        with self.transaction():
+            rows = self.db.execute("SELECT * FROM corrections WHERE source=? AND batch=? AND ordinal=? ORDER BY id",
+                                   (source, batch, ordinal)).fetchall()
+            if not rows:
+                raise HarvestError("correction_unknown", f"{source}/{batch}/{ordinal} has no registered correction")
+            first = rows[0]
+            if first["withdrawn_at"]:
+                return {"source": source, "batch": batch, "ordinal": ordinal,
+                        "withdrawn_at": first["withdrawn_at"], "unchanged": True}
+            at = utc_now()
+            self.db.execute("UPDATE corrections SET withdrawn_at=? WHERE source=? AND batch=? AND ordinal=?",
+                            (at, source, batch, ordinal))
+            targets = sorted({(row["target_record_id"], row["target_version"]) for row in rows})
+            self.event("correction_withdrawn", source, batch, ordinal,
+                       {"reason": reason, "effective_at": first["effective_at"],
+                        "supersedes": [{"record_id": record_id, "version": version}
+                                       for record_id, version in targets]})
+            return {"source": source, "batch": batch, "ordinal": ordinal,
+                    "withdrawn_at": at, "unchanged": False}
 
     def withdraw(self, source: str, reason: str) -> dict:
         with self.transaction():

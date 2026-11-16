@@ -72,7 +72,8 @@ class Harvester:
         for record, raw in zip(records, rows):
             decision = assess(record, source, manifest.captured_at)
             items.append((record, raw, decision.status, decision.reasons))
-        return self.ledger.commit_page(manifest.source, manifest.batch, ordinal, items)
+        return self.ledger.commit_page(manifest.source, manifest.batch, ordinal, items,
+                                       correction=page.correction)
 
     def resume(self, manifest_path: str | Path) -> dict:
         return self.ingest(manifest_path)
@@ -84,6 +85,11 @@ class Harvester:
         if not reason.strip():
             raise HarvestError("withdraw_reason", "withdrawal requires a reason")
         return self.ledger.withdraw(key, reason.strip())
+
+    def withdraw_correction(self, source: str, batch: str, ordinal: int, reason: str) -> dict:
+        if not reason.strip():
+            raise HarvestError("withdraw_reason", "withdrawal requires a reason")
+        return self.ledger.withdraw_correction(source, batch, ordinal, reason.strip())
 
     def inspect(self, source: str, batch: str) -> dict:
         return self.ledger.batch(source, batch)

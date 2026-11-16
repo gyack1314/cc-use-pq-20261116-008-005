@@ -18,16 +18,38 @@ class Lineage:
                 if row["record_id"] == record_id]
         if not rows:
             raise HarvestError("record_unknown", f"{source}/{record_id}")
+        corrections = self.ledger.corrections(source=source)
+        by_page: dict[tuple[str, int], list[dict]] = defaultdict(list)
+        incoming: dict[tuple[str, int], list[dict]] = defaultdict(list)
+        for correction in corrections:
+            by_page[(correction["batch"], correction["ordinal"])].append(correction)
+            incoming[(correction["target_record_id"], correction["target_version"])].append(correction)
         entries = []
         previous = None
         for row in rows:
             fields = self._field_changes(previous["record"] if previous else None, row["record"])
-            entries.append({"observation_id": row["id"], "batch": row["batch"],
-                            "page": row["ordinal"], "version": row["version"],
-                            "captured_at": row["captured_at"], "observed_at": row["observed_at"],
-                            "identity": row["identity"], "status": row["status"],
-                            "reasons": row["reasons"], "raw_digest": row["raw_digest"],
-                            "changed_fields": fields, "record": row["record"]})
+            entry = {"observation_id": row["id"], "batch": row["batch"],
+                     "page": row["ordinal"], "version": row["version"],
+                     "captured_at": row["captured_at"], "observed_at": row["observed_at"],
+                     "effective_at": row["effective_at"],
+                     "identity": row["identity"], "status": row["status"],
+                     "reasons": row["reasons"], "raw_digest": row["raw_digest"],
+                     "changed_fields": fields, "record": row["record"]}
+            page_corrections = by_page.get((row["batch"], row["ordinal"]))
+            if page_corrections:
+                first = page_corrections[0]
+                targets = sorted({(item["target_record_id"], item["target_version"])
+                                  for item in page_corrections})
+                entry["correction"] = {
+                    "effective_at": first["effective_at"], "withdrawn_at": first["withdrawn_at"],
+                    "supersedes": [{"record_id": target, "version": version}
+                                   for target, version in targets]}
+            entry["superseded_by"] = [
+                {"batch": item["batch"], "page": item["ordinal"],
+                 "effective_at": item["effective_at"], "withdrawn_at": item["withdrawn_at"]}
+                for item in sorted(incoming.get((record_id, row["version"]), []),
+                                   key=lambda item: item["id"])]
+            entries.append(entry)
             previous = row
         source_row = self.ledger.db.execute("SELECT withdrawn_at FROM sources WHERE key=?", (source,)).fetchone()
         current = Delivery(self.ledger).current(include_quarantine=True)
@@ -38,6 +60,26 @@ class Lineage:
         return {"source": source, "record_id": record_id, "versions": entries,
                 "withdrawn_at": source_row[0], "selected_current": visible,
                 "latest_status": rows[-1]["status"]}
+
+    def corrections(self, *, source: str | None = None) -> dict:
+        rows = self.ledger.corrections(source=source)
+        by_page: dict[tuple[str, str, int], list[dict]] = {}
+        for row in rows:
+            by_page.setdefault((row["source"], row["batch"], row["ordinal"]), []).append(row)
+        result = []
+        for key in sorted(by_page, key=lambda item: min(row["id"] for row in by_page[item])):
+            group = by_page[key]
+            first = group[0]
+            targets = sorted({(row["target_record_id"], row["target_version"]) for row in group})
+            result.append({"source": first["source"], "batch": first["batch"],
+                           "ordinal": first["ordinal"], "effective_at": first["effective_at"],
+                           "registered_at": first["registered_at"],
+                           "withdrawn_at": first["withdrawn_at"],
+                           "state": "withdrawn" if first["withdrawn_at"] else "active",
+                           "records": sorted({row["record_id"] for row in group if row["record_id"]}),
+                           "supersedes": [{"record_id": record_id, "version": version}
+                                          for record_id, version in targets]})
+        return {"corrections": result}
 
     @staticmethod
     def _field_changes(previous: dict | None, current: dict) -> list[str]:
